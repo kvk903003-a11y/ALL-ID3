@@ -7,59 +7,45 @@ from datetime import datetime, time as dt_time
 import pytz
 import time
 
-# ---------------- SETTINGS ----------------
+# ================= SETTINGS =================
 REFRESH_SECONDS = 60
 TOP_N = 10
 
-import streamlit as st
-POLYGON_KEY = st.secrets["POLYGON_KEY"]
+# Get Polygon key from secrets or fallback
+POLYGON_KEY = st.secrets["POLYGON_KEY"] if "POLYGON_KEY" in st.secrets else "YOUR_POLYGON_API_KEY"
 
-# POLYGON_KEY = "YOUR_POLYGON_API_KEY"  # Replace with your Polygon API key
+st.set_page_config(page_title="Efficient Intraday Scanner", layout="wide")
+st.title("📊 Batch Intraday Scanner (Polygon + Yahoo)")
 
-st.set_page_config(page_title="Intraday Scanner", layout="wide")
-st.title("📊 North America Intraday Signal Scanner")
-
-# ---------------- TIME ----------------
+# ================= LIVE EST TIME =================
 est = pytz.timezone("US/Eastern")
 st.markdown(f"### 🕒 Live EST Time: {datetime.now(est).strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ---------------- MARKET HOURS ----------------
-def market_status():
+# ================= MARKET HOURS =================
+def market_session():
     now = datetime.now(est).time()
     us_open = dt_time(9,30)
     us_close = dt_time(16,0)
-    tsx_open = dt_time(9,30)
-    tsx_close = dt_time(16,0)
-    session = "Closed"
     if us_open <= now <= us_close:
-        session = "US Regular"
-    elif tsx_open <= now <= tsx_close:
-        session = "TSX Regular"
-    return session
+        return "US Regular"
+    elif us_open <= now <= us_close:
+        return "TSX Regular"
+    return "Closed"
 
-session_status = market_status()
+session_status = market_session()
 st.write(f"Market Session: {session_status}")
 
-# ---------------- LOAD TICKERS ----------------
+# ================= LOAD TICKERS =================
 @st.cache_data(ttl=3600)
 def load_tickers():
-    try:
-        tsx = pd.read_csv("data/tsx_tickers.csv")["Symbol"].dropna().tolist()
-    except:
-        tsx = ["SHOP.TO","RY.TO","TD.TO","SU.TO","ENB.TO"]
-    try:
-        nasdaq = pd.read_csv("data/nasdaq_tickers.csv")["Symbol"].dropna().tolist()
-    except:
-        nasdaq = ["AAPL","MSFT","NVDA","TSLA","AMD"]
-    try:
-        nyse = pd.read_csv("data/nyse_tickers.csv")["Symbol"].dropna().tolist()
-    except:
-        nyse = ["JPM","XOM","BA","KO","DIS"]
-    return tsx[:50], nasdaq[:50], nyse[:50]
+    tsx = pd.read_csv("data/tsx_tickers.csv")["Symbol"].dropna().tolist()[:50]
+    nasdaq = pd.read_csv("data/nasdaq_tickers.csv")["Symbol"].dropna().tolist()[:50]
+    nyse = pd.read_csv("data/nyse_tickers.csv")["Symbol"].dropna().tolist()[:50]
+    return tsx, nasdaq, nyse
 
 TSX, NASDAQ, NYSE = load_tickers()
 
-# ---------------- INDEX FILTER ----------------
+# ================= INDEX TREND FILTER =================
 @st.cache_data(ttl=300)
 def get_index_trend(symbol):
     df = yf.download(symbol, period="6mo", interval="1d", progress=False)
@@ -76,31 +62,41 @@ tsx_bull = get_index_trend("^GSPTSE")
 st.write(f"SPY Bullish: {spy_bull}")
 st.write(f"TSX Bullish: {tsx_bull}")
 
-# ---------------- POLYGON FETCH ----------------
-def polygon_intraday(ticker):
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/2023-01-01/2026-12-31?adjusted=true&sort=desc&limit=50000&apiKey={POLYGON_KEY}"
-    try:
-        r = requests.get(url)
-        data = r.json()
-        if "results" not in data:
-            return None
-        df = pd.DataFrame(data["results"])
+# ================= POLYGON SNAPSHOT FETCH =================
+def fetch_polygon_snapshot(tickers):
+    """
+    Fetch a snapshot of multiple US tickers in one API call.
+    This endpoint returns last minute aggregates and other useful info.
+    """
+    symbols = ",".join(tickers)
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?symbols={symbols}&apiKey={POLYGON_KEY}"
+    data = requests.get(url).json()
+    results = {}
+    if "tickers" not in data:
+        return {}
+    for item in data["tickers"]:
+        ticker = item["ticker"]
+        # intraday bars
+        bars = item.get("day", {}).get("aggregates", [])
+        # if no bars, skip
+        if not bars:
+            continue
+        df = pd.DataFrame(bars)
+        # normalize polygon minute fields
         df["t"] = pd.to_datetime(df["t"], unit="ms")
-        df.set_index("t", inplace=True)
         df.rename(columns={"o":"Open","c":"Close","h":"High","l":"Low","v":"Volume"}, inplace=True)
-        return df
-    except:
-        return None
+        df.set_index("t", inplace=True)
+        results[ticker] = df
+    return results
 
-# ---------------- SIGNAL ENGINE ----------------
-def intraday_signal(symbol, market_type):
+# ================= SIGNAL LOGIC =================
+def compute_score(df):
+    """
+    Compute score for a symbol's intraday dataframe.
+    """
+    if df is None or len(df) < 30:
+        return None
     try:
-        if market_type == "TSX":
-            df = yf.download(symbol, period="5d", interval="5m", progress=False)
-        else:
-            df = polygon_intraday(symbol)
-        if df is None or len(df) < 50:
-            return None
         close = df["Close"]
         high = df["High"]
         low = df["Low"]
@@ -115,6 +111,7 @@ def intraday_signal(symbol, market_type):
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
         atr = (high - low).rolling(14).mean()
+
         last = -1
         score = 0
         if ema10.iloc[last] > ema30.iloc[last]:
@@ -123,40 +120,51 @@ def intraday_signal(symbol, market_type):
             score += 30
         if close.iloc[last] > close.rolling(20).mean().iloc[last]:
             score += 30
-        # Penalize weak market but do not block
-        if market_type == "US" and not spy_bull:
-            score -= 20
-        if market_type == "TSX" and not tsx_bull:
-            score -= 20
-        entry = close.iloc[last]
-        stop = entry - atr.iloc[last]
-        target = entry + (atr.iloc[last]*2)
-        return {
-            "Symbol": symbol,
+        return score, close.iloc[last], atr.iloc[last]
+    except:
+        return None
+
+# ================= SCAN TSX =================
+results = []
+
+for ticker in TSX:
+    df = None
+    try:
+        df = yf.download(ticker, period="5d", interval="5m", progress=False)
+    except:
+        df = None
+    out = compute_score(df)
+    if out:
+        score, entry, atr_val = out
+        stop = entry - atr_val
+        target = entry + (atr_val * 2)
+        results.append({
+            "Symbol": ticker,
             "Score": round(score,2),
             "Buy": round(entry,2),
             "Sell Target": round(target,2),
             "Stop Loss": round(stop,2)
-        }
-    except:
-        return None
+        })
 
-# ---------------- SCAN MARKETS ----------------
-results = []
-for ticker in TSX:
-    sig = intraday_signal(ticker, "TSX")
-    if sig:
-        results.append(sig)
-for ticker in NASDAQ:
-    sig = intraday_signal(ticker, "US")
-    if sig:
-        results.append(sig)
-for ticker in NYSE:
-    sig = intraday_signal(ticker, "US")
-    if sig:
-        results.append(sig)
+# ================= SCAN US SNAPSHOT =================
+us_tickers = NASDAQ + NYSE
+polygon_data = fetch_polygon_snapshot(us_tickers)
 
-# ---------------- DISPLAY ----------------
+for ticker, df in polygon_data.items():
+    out = compute_score(df)
+    if out:
+        score, entry, atr_val = out
+        stop = entry - atr_val
+        target = entry + (atr_val * 2)
+        results.append({
+            "Symbol": ticker,
+            "Score": round(score,2),
+            "Buy": round(entry,2),
+            "Sell Target": round(target,2),
+            "Stop Loss": round(stop,2)
+        })
+
+# ================= DISPLAY =================
 if results:
     df_results = pd.DataFrame(results)
     df_results = df_results.sort_values("Score", ascending=False)
@@ -166,6 +174,6 @@ if results:
 else:
     st.warning("No qualifying stocks right now based on filters.")
 
-# ---------------- AUTO REFRESH ----------------
+# ================= AUTO REFRESH =================
 time.sleep(REFRESH_SECONDS)
 st.rerun()
