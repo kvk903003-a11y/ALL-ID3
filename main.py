@@ -10,7 +10,9 @@ import time
 # ---------------- SETTINGS ----------------
 REFRESH_SECONDS = 60
 TOP_N = 10
-POLYGON_KEY = "YOUR_POLYGON_API_KEY"  # Replace with your Polygon API key
+# POLYGON_KEY = "YOUR_POLYGON_API_KEY"  # Replace with your Polygon API key
+import streamlit as st
+POLYGON_KEY = st.secrets["POLYGON_KEY"]
 
 st.set_page_config(page_title="Intraday Scanner", layout="wide")
 st.title("📊 North America Intraday Signal Scanner")
